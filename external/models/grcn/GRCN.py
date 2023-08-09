@@ -20,12 +20,11 @@ from elliot.recommender import BaseRecommenderModel
 from elliot.recommender.base_recommender_model import init_charger
 from elliot.recommender.recommender_utils_mixin import RecMixin
 from .GRCNModel import GRCNModel
-from external.mumo4rec.MultiModRec import MultiModRec
 
 from torch_sparse import SparseTensor
 
 
-class GRCN(RecMixin, BaseRecommenderModel, MultiModRec):
+class GRCN(RecMixin, BaseRecommenderModel):
     r"""
     Graph-Refined Convolutional Network for Multimedia Recommendation with Implicit Feedback
 

@@ -3,6 +3,7 @@ from elliot.dataset.modular_loaders.generic.item_attributes import ItemAttribute
 from elliot.dataset.modular_loaders.kg.minervini_style import KGCompletion
 from elliot.dataset.modular_loaders.visual.visual_attribute import VisualAttribute
 from elliot.dataset.modular_loaders.textual.textual_attribute import TextualAttribute
+from elliot.dataset.modular_loaders.audio.audio_attribute import AudioAttribute
 from elliot.dataset.modular_loaders.textual.textual_attribute_sequence import TextualAttributeSequence
 from elliot.dataset.modular_loaders.textual.interactions_attribute import InteractionsTextualAttributes
 from elliot.dataset.modular_loaders.textual.sentiment_interactions_attribute import \

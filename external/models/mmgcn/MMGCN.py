@@ -19,13 +19,12 @@ from elliot.dataset.samplers import custom_sampler_full as csf
 from elliot.recommender import BaseRecommenderModel
 from elliot.recommender.base_recommender_model import init_charger
 from elliot.recommender.recommender_utils_mixin import RecMixin
-from external.mumo4rec.MultiModRec import MultiModRec
 from .MMGCNModel import MMGCNModel
 
 from torch_sparse import SparseTensor
 
 
-class MMGCN(RecMixin, BaseRecommenderModel, MultiModRec):
+class MMGCN(RecMixin, BaseRecommenderModel):
     r"""
     MMGCN: Multi-modal Graph Convolution Network for Personalized Recommendation of Micro-video
 

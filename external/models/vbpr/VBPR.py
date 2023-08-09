@@ -1,19 +1,11 @@
-"""
-Module description:
-
-"""
-
-__version__ = '0.3.1'
-__author__ = 'Vito Walter Anelli, Claudio Pomo, Daniele Malitesta'
-__email__ = 'vitowalter.anelli@poliba.it, claudio.pomo@poliba.it, daniele.malitesta@poliba.it'
-
 import torch
 import os
 import numpy as np
 from tqdm import tqdm
 from ast import literal_eval as make_tuple
+import math
 
-from elliot.dataset.samplers import custom_sampler as cs
+from .custom_sampler import Sampler
 from elliot.utils.write import store_recommendation
 
 from elliot.recommender import BaseRecommenderModel
@@ -67,7 +59,7 @@ class VBPR(RecMixin, BaseRecommenderModel):
         if self._batch_size < 1:
             self._batch_size = self._data.transactions
 
-        self._sampler = cs.Sampler(self._data.i_train_dict, self._seed)
+        self._sampler = Sampler(self._data.i_train_dict, self._batch_size, self._seed)
 
         for m_id, m in enumerate(self._modalities):
             self.__setattr__(f'''_side_{m}''',
@@ -108,10 +100,18 @@ class VBPR(RecMixin, BaseRecommenderModel):
         for it in self.iterate(self._epochs):
             loss = 0
             steps = 0
-            with tqdm(total=int(self._data.transactions // self._batch_size), disable=not self._verbose) as t:
-                for batch in self._sampler.step(self._data.transactions, self._batch_size):
+            n_batch = int(
+                self._data.transactions / self._batch_size) if self._data.transactions % self._batch_size == 0 else int(
+                self._data.transactions / self._batch_size) + 1
+            with tqdm(total=n_batch, disable=not self._verbose) as t:
+                for _ in range(n_batch):
+                    user, pos, neg = self._sampler.step()
                     steps += 1
-                    loss += self._model.train_step(batch)
+                    loss += self._model.train_step((user, pos, neg))
+
+                    if math.isnan(loss) or math.isinf(loss) or (not loss):
+                        break
+
                     t.set_postfix({'loss': f'{loss / steps:.5f}'})
                     t.update()
 

@@ -19,12 +19,11 @@ from elliot.dataset.samplers import custom_sampler_batch as csb
 from elliot.recommender import BaseRecommenderModel
 from elliot.recommender.base_recommender_model import init_charger
 from elliot.recommender.recommender_utils_mixin import RecMixin
-from external.mumo4rec.MultiModRec import MultiModRec
 from torch_sparse import SparseTensor
 from .LATTICEModel import LATTICEModel
 
 
-class LATTICE(RecMixin, BaseRecommenderModel, MultiModRec):
+class LATTICE(RecMixin, BaseRecommenderModel):
     r"""
     Mining Latent Structures for Multimedia Recommendation
 
