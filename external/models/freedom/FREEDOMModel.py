@@ -163,7 +163,7 @@ class FREEDOMModel(torch.nn.Module, ABC):
         ego_embeddings = torch.cat((self.Gu.weight, self.Gi.weight), dim=0)
         all_embeddings = [ego_embeddings]
         for i in range(self.n_ui_layers):
-            side_embeddings = torch.sparse.mm(adj, ego_embeddings)
+            side_embeddings = torch.sparse.mm(adj.to(self.device), ego_embeddings)
             ego_embeddings = side_embeddings
             all_embeddings += [ego_embeddings]
         all_embeddings = torch.stack(all_embeddings, dim=1)
