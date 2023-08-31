@@ -75,7 +75,7 @@ class BM3Model(torch.nn.Module, ABC):
         self.Gu.to(self.device)
         self.Gi.to(self.device)
 
-        self.predictor = torch.nn.Linear(self.embed_k, self.embed_k)
+        self.predictor = torch.nn.Linear(self.embed_k, self.embed_k).to(self.device)
         self.reg_loss = EmbLoss()
         torch.nn.init.xavier_normal_(self.predictor.weight)
 
