@@ -1,12 +1,3 @@
-"""
-Module description:
-
-"""
-
-__version__ = '0.3.0'
-__author__ = 'Vito Walter Anelli, Claudio Pomo, Daniele Malitesta'
-__email__ = 'vitowalter.anelli@poliba.it, claudio.pomo@poliba.it, daniele.malitesta@poliba.it'
-
 from abc import ABC
 
 from torch_geometric.nn import LGConv
@@ -16,6 +7,7 @@ import torch_geometric
 import numpy as np
 import random
 from torch_sparse import SparseTensor, mul, mul_nnz, sum, add, fill_diag
+from .NGCFLayer import NGCFLayer
 
 
 class LATTICEModel(torch.nn.Module, ABC):
@@ -33,6 +25,9 @@ class LATTICEModel(torch.nn.Module, ABC):
                  top_k,
                  multimodal_features,
                  adj,
+                 cf_model,
+                 weight_size,
+                 dropout_list,
                  random_seed,
                  name="LATTICE",
                  **kwargs
@@ -60,15 +55,36 @@ class LATTICEModel(torch.nn.Module, ABC):
         self.top_k = top_k
         self.n_layers = num_layers
         self.n_ui_layers = num_ui_layers
-        self.adj = self.compute_normalized_laplacian(adj, 1)
+        self.cf_model = cf_model
+        self.adj = adj
+        self.weight_size = weight_size
+        self.weight_size = [self.embed_k] + self.weight_size
 
         # collaborative embeddings
         self.Gu = torch.nn.Embedding(self.num_users, self.embed_k)
-        torch.nn.init.xavier_uniform_(self.Gu.weight)
-        self.Gu.to(self.device)
         self.Gi = torch.nn.Embedding(self.num_items, self.embed_k)
+        torch.nn.init.xavier_uniform_(self.Gu.weight)
         torch.nn.init.xavier_uniform_(self.Gi.weight)
+        self.Gu.to(self.device)
         self.Gi.to(self.device)
+
+        if cf_model == 'ngcf':
+            propagation_network_list = []
+            self.dropout_layers = []
+            for layer in range(self.n_ui_layers):
+                propagation_network_list.append((NGCFLayer(self.weight_size[layer],
+                                                           self.weight_size[layer + 1]), 'x, edge_index -> x'))
+                self.dropout_layers.append(torch.nn.Dropout(p=dropout_list[layer]))
+            self.propagation_network_recommend = torch_geometric.nn.Sequential('x, edge_index', propagation_network_list)
+            self.propagation_network_recommend.to(self.device)
+
+        elif cf_model == 'lightgcn':
+            propagation_network_list = []
+            for layer in range(self.n_ui_layers):
+                propagation_network_list.append((LGConv(normalize=False), 'x, edge_index -> x'))
+            self.propagation_network_recommend = torch_geometric.nn.Sequential('x, edge_index',
+                                                                               propagation_network_list)
+            self.propagation_network_recommend.to(self.device)
 
         # multimodal features
         self.Gim = torch.nn.ParameterDict()
@@ -101,17 +117,9 @@ class LATTICEModel(torch.nn.Module, ABC):
         self.propagation_network = torch_geometric.nn.Sequential('x, edge_index', propagation_network_list)
         self.propagation_network.to(self.device)
 
-        # lightgcn as user-item graph model for recommendation
-        propagation_network_list = []
-        for layer in range(self.n_ui_layers):
-            propagation_network_list.append((LGConv(normalize=False), 'x, edge_index -> x'))
-
-        self.propagation_network_recommend = torch_geometric.nn.Sequential('x, edge_index', propagation_network_list)
-        self.propagation_network_recommend.to(self.device)
-
-        self.softplus = torch.nn.Softplus()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         self.lr_scheduler = self.set_lr_scheduler()
+        self.softmax = torch.nn.Softmax(dim=0)
 
     @staticmethod
     def build_sim(context):
@@ -146,7 +154,7 @@ class LATTICEModel(torch.nn.Module, ABC):
     def propagate_embeddings(self, build_item_graph=False):
         if build_item_graph:
             weights = torch.cat([torch.unsqueeze(w, 0) for w in self.importance_weights_m], dim=0)
-            softmax_weights = torch.softmax(weights, dim=0)
+            softmax_weights = self.softmax(weights)
             learned_adj_addendum = []
             original_adj_addendum = []
             for m_id, m in enumerate(self.modalities):
@@ -184,15 +192,30 @@ class LATTICEModel(torch.nn.Module, ABC):
         ego_embeddings = torch.cat((self.Gu.weight.to(self.device), self.Gi.weight.to(self.device)), 0)
         all_embeddings = [ego_embeddings]
 
-        for layer in range(self.n_ui_layers):
-            all_embeddings += [torch.nn.functional.normalize(list(
-                self.propagation_network_recommend.children()
-            )[layer](all_embeddings[layer].to(self.device), self.adj.to(self.device)), p=2, dim=1)]
+        if self.cf_model == 'ngcf':
+            embedding_idx = 0
+            for layer in range(self.n_ui_layers):
+                all_embeddings += [torch.nn.functional.normalize(self.dropout_layers[embedding_idx](list(
+                    self.propagation_network_recommend.children()
+                )[layer](all_embeddings[embedding_idx].to(self.device), self.adj.to(self.device))), p=2, dim=1)]
+                embedding_idx += 1
+            all_embeddings = torch.stack(all_embeddings, dim=1)
+            all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
+            gu, gi = torch.split(all_embeddings, [self.num_users, self.num_items], 0)
+            return gu, gi + torch.nn.functional.normalize(item_embedding.to(self.device), p=2, dim=1)
 
-        all_embeddings = torch.stack(all_embeddings, dim=1)
-        all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
-        gu, gi = torch.split(all_embeddings, [self.num_users, self.num_items], 0)
-        return gu, gi + torch.nn.functional.normalize(item_embedding.to(self.device), p=2, dim=1)
+        elif self.cf_model == 'lightgcn':
+            for layer in range(self.n_ui_layers):
+                all_embeddings += [torch.nn.functional.normalize(list(
+                    self.propagation_network_recommend.children()
+                )[layer](all_embeddings[layer].to(self.device), self.adj.to(self.device)), p=2, dim=1)]
+            all_embeddings = torch.stack(all_embeddings, dim=1)
+            all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
+            gu, gi = torch.split(all_embeddings, [self.num_users, self.num_items], 0)
+            return gu, gi + torch.nn.functional.normalize(item_embedding.to(self.device), p=2, dim=1)
+
+        elif self.cf_model == 'mf':
+            return self.Gu.weight, self.Gi.weight + torch.nn.functional.normalize(item_embedding.to(self.device), p=2, dim=1)
 
     def forward(self, inputs, **kwargs):
         gum, gim = inputs
@@ -209,13 +232,11 @@ class LATTICEModel(torch.nn.Module, ABC):
     def train_step(self, batch, build_item_graph):
         gum, gim = self.propagate_embeddings(build_item_graph)
         user, pos, neg = batch
-        xu_pos, gamma_u_m, gamma_i_pos_m = self.forward(inputs=(gum[user[:, 0]], gim[pos[:, 0]]))
-        xu_neg, _, gamma_i_neg_m = self.forward(inputs=(gum[user[:, 0]], gim[neg[:, 0]]))
+        xu_pos, gamma_u_m, gamma_i_pos_m = self.forward(inputs=(gum[user], gim[pos]))
+        xu_neg, _, gamma_i_neg_m = self.forward(inputs=(gum[user], gim[neg]))
 
         loss = -torch.mean(torch.nn.functional.logsigmoid(xu_pos - xu_neg))
-        reg_loss = self.l_w * (1 / 2) * (gamma_u_m.norm(2).pow(2) +
-                                         gamma_i_pos_m.norm(2).pow(2) +
-                                         gamma_i_neg_m.norm(2).pow(2)) / user.shape[0]
+        reg_loss = self.l_w * (1 / 2) * ((gamma_u_m**2).sum() + (gamma_i_pos_m**2).sum() + (gamma_i_neg_m**2).sum()) / len(user)
         loss += reg_loss
 
         self.optimizer.zero_grad()

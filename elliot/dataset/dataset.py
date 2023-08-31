@@ -203,12 +203,25 @@ class DataSet(AbstractDataset):
         else:
             self.side_information = side_information_data
 
+        # self.side_information = side_information_data
         self.train_dict = self.dataframe_to_dict(data_tuple[0])
 
         self.users = list(self.train_dict.keys())
         self.items = list({k for a in self.train_dict.values() for k in a.keys()})
         self.num_users = len(self.users)
         self.num_items = len(self.items)
+
+        # train_users = set(data_tuple[0]['userId'].tolist())
+        # train_items = set(data_tuple[0]['itemId'].tolist())
+        # val_users = set(data_tuple[1]['userId'].tolist())
+        # val_items = set(data_tuple[1]['itemId'].tolist())
+        # test_users = set(data_tuple[2]['userId'].tolist())
+        # test_items = set(data_tuple[2]['itemId'].tolist())
+        # self.users = set.union(train_users, val_users, test_users)
+        # self.items = set.union(train_items, val_items, test_items)
+        # self.num_users = len(self.users)
+        # self.num_items = len(self.items)
+
         self.transactions = sum(len(v) for v in self.train_dict.values())
 
         sparsity = 1 - (self.transactions / (self.num_users * self.num_items))
@@ -223,6 +236,10 @@ class DataSet(AbstractDataset):
 
         self.i_train_dict = {self.public_users[user]: {self.public_items[i]: v for i, v in items.items()}
                              for user, items in self.train_dict.items()}
+
+        self.edge_index = data_tuple[0]
+        self.edge_index['userId'] = self.edge_index['userId'].map(self.public_users)
+        self.edge_index['itemId'] = self.edge_index['itemId'].map(self.public_items)
 
         self.sp_i_train = self.build_sparse()
         self.sp_i_train_ratings = self.build_sparse_ratings()

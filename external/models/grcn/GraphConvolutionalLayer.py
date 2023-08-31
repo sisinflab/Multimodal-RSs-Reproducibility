@@ -6,8 +6,8 @@ from torch_sparse import matmul, mul_nnz
 
 
 class GraphConvolutionalLayer(MessagePassing, ABC):
-    def __init__(self, has_act):
-        super(GraphConvolutionalLayer, self).__init__(aggr='add')
+    def __init__(self, has_act, aggr_mode):
+        super(GraphConvolutionalLayer, self).__init__(aggr=aggr_mode)
         self.leaky_relu = torch.nn.LeakyReLU()
         self.has_act = has_act
 

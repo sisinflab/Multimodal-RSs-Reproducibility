@@ -10,7 +10,7 @@ experiment:
         visual_features: ../data/{0}/image_feat
       - dataloader: TextualAttribute
         textual_features: ../data/{0}/text_feat
-  dataset: baby
+  dataset: baby_2
   top_k: 50
   evaluation:
     cutoffs: [10, 20, 50]
@@ -18,7 +18,7 @@ experiment:
   gpu: -1
   external_models_path: ../external/models/__init__.py
   models:
-    external.VBPR:
+    external.MBPR:
       meta:
         hyper_opt_alg: grid
         verbose: True
@@ -27,16 +27,18 @@ experiment:
         validation_rate: 1
         validation_metric: Recall@20
         restore: False
-      lr: 0.0005
+      lr: 0.001
       modalities: ('visual', 'textual')
-      epochs: 200
+      loaders: ('VisualAttribute','TextualAttribute')
+      epochs: 1000
       factors: 64
-      batch_size: 1024
-      l_w: 1e-5
+      batch_size: 2048
+      l_w: 2.0
+      lr_sched: (1.0,50)
       comb_mod: concat
-      seed: 123
+      seed: 999
       early_stopping:
-        patience: 10
+        patience: 20
         mode: auto
         monitor: Recall@20
         verbose: True

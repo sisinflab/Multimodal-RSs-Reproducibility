@@ -1,12 +1,3 @@
-"""
-Module description:
-
-"""
-
-__version__ = '0.3.0'
-__author__ = 'Vito Walter Anelli, Claudio Pomo, Daniele Malitesta'
-__email__ = 'vitowalter.anelli@poliba.it, claudio.pomo@poliba.it, daniele.malitesta@poliba.it'
-
 from ast import literal_eval as make_tuple
 
 from tqdm import tqdm
@@ -15,12 +6,14 @@ import torch
 import os
 
 from elliot.utils.write import store_recommendation
-from elliot.dataset.samplers import custom_sampler_full as csf
+from .custom_sampler import TrainingDataset
 from elliot.recommender import BaseRecommenderModel
 from elliot.recommender.base_recommender_model import init_charger
 from elliot.recommender.recommender_utils_mixin import RecMixin
 from .MMGCNModel import MMGCNModel
+import math
 
+from torch.utils.data import DataLoader
 from torch_sparse import SparseTensor
 
 
@@ -86,14 +79,26 @@ class MMGCN(RecMixin, BaseRecommenderModel):
         ]
         self.autoset_params()
 
-        self.set_modalities(self._modalities)
-
         np.random.seed(self._seed)
-        self._sampler = csf.Sampler(self._data.i_train_dict, self._seed)
         if self._batch_size < 1:
             self._batch_size = self._num_users
 
         row, col = data.sp_i_train.nonzero()
+        train_dataset = TrainingDataset(self._num_users,
+                                        self._num_items,
+                                        {u: list(data.i_train_dict[u].keys()) for u in data.i_train_dict},
+                                        np.array([row, col]),
+                                        self._seed)
+
+        torch.manual_seed(self._seed)
+        torch.cuda.manual_seed(self._seed)
+        torch.cuda.manual_seed_all(self._seed)
+        torch.backends.cudnn.deterministic = True
+
+        self.train_dataloader = DataLoader(dataset=train_dataset,
+                                           batch_size=self._batch_size,
+                                           shuffle=True)
+
         col = [c + self._num_users for c in col]
         edge_index = np.array([row, col])
 
@@ -103,6 +108,15 @@ class MMGCN(RecMixin, BaseRecommenderModel):
                                 sparse_sizes=(self._num_users + self._num_items,
                                               self._num_users + self._num_items))
 
+        for m_id, m in enumerate(self._modalities):
+            self.__setattr__(f'''_side_{m}''',
+                             self._data.side_information.__getattribute__(f'''{self._loaders[m_id]}'''))
+
+        all_multimodal_features = []
+        for m_id, m in enumerate(self._modalities):
+            all_multimodal_features.append(self.__getattribute__(
+                f'''_side_{self._modalities[m_id]}''').object.get_all_features())
+
         self._model = MMGCNModel(
             num_users=self._num_users,
             num_items=self._num_items,
@@ -110,12 +124,13 @@ class MMGCN(RecMixin, BaseRecommenderModel):
             embed_k=self._factors,
             embed_k_multimod=self._factors_multimod,
             l_w=self._l_w,
+            batch_size=self._batch_size,
             num_layers=self._num_layers,
             modalities=self._modalities,
             aggregation=self._aggregation,
             concatenation=self._concat,
             has_id=self._has_id,
-            multimodal_features=self.get_all_features(),
+            multimodal_features=all_multimodal_features,
             adj=self.adj,
             random_seed=self._seed
         )
@@ -123,25 +138,28 @@ class MMGCN(RecMixin, BaseRecommenderModel):
     @property
     def name(self):
         return "MMGCN" \
-               + f"_{self.get_base_params_shortcut()}" \
-               + f"_{self.get_params_shortcut()}"
+            + f"_{self.get_base_params_shortcut()}" \
+            + f"_{self.get_params_shortcut()}"
 
     def train(self):
         if self._restore:
             return self.restore_weights()
 
-        row, col = self._data.sp_i_train.nonzero()
-        edge_index = np.array([row, col]).transpose()
-
         for it in self.iterate(self._epochs):
             loss = 0
             steps = 0
             self._model.train()
-            np.random.shuffle(edge_index)
-            with tqdm(total=int(self._data.transactions // self._batch_size), disable=not self._verbose) as t:
-                for batch in self._sampler.step(edge_index, self._data.transactions, self._batch_size):
+            n_batch = int(
+                self._data.transactions / self._batch_size) if self._data.transactions % self._batch_size == 0 else int(
+                self._data.transactions / self._batch_size) + 1
+            with tqdm(total=n_batch, disable=not self._verbose) as t:
+                for user_tensor, item_tensor in self.train_dataloader:
                     steps += 1
-                    loss += self._model.train_step(batch)
+                    loss += self._model.train_step(user_tensor, item_tensor)
+
+                    if math.isnan(loss) or math.isinf(loss) or (not loss):
+                        break
+
                     t.set_postfix({'loss': f'{loss / steps:.5f}'})
                     t.update()
 
@@ -152,9 +170,10 @@ class MMGCN(RecMixin, BaseRecommenderModel):
         predictions_top_k_val = {}
         self._model.eval()
         with torch.no_grad():
+            gu, gi = self._model.result[:self._num_users], self._model.result[self._num_users:]
             for index, offset in enumerate(range(0, self._num_users, self._batch_size)):
                 offset_stop = min(offset + self._batch_size, self._num_users)
-                predictions = self._model.predict(offset, offset_stop)
+                predictions = self._model.predict(gu[offset:offset_stop], gi)
                 recs_val, recs_test = self.process_protocol(k, predictions, offset, offset_stop)
                 predictions_top_k_val.update(recs_val)
                 predictions_top_k_test.update(recs_test)

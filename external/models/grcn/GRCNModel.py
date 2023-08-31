@@ -1,20 +1,108 @@
-"""
-Module description:
-
-"""
-
-__version__ = '0.3.0'
-__author__ = 'Vito Walter Anelli, Claudio Pomo, Daniele Malitesta'
-__email__ = 'vitowalter.anelli@poliba.it, claudio.pomo@poliba.it, daniele.malitesta@poliba.it'
-
 from abc import ABC
 
 from .GraphRefiningLayer import GraphRefiningLayer
 from .GraphConvolutionalLayer import GraphConvolutionalLayer
 import torch
-import torch_geometric
 import numpy as np
 import random
+from torch_geometric.utils import dropout_adj
+
+
+class EGCN(torch.nn.Module):
+    def __init__(self,
+                 num_user,
+                 num_item,
+                 dim_E,
+                 aggr_mode,
+                 has_act,
+                 has_norm,
+                 num_layers):
+        super(EGCN, self).__init__()
+        self.num_user = num_user
+        self.num_item = num_item
+        self.dim_E = dim_E
+        self.aggr_mode = aggr_mode
+        self.has_act = has_act
+        self.has_norm = has_norm
+        self.id_embedding = torch.nn.Parameter(torch.nn.init.xavier_normal_(torch.rand((num_user + num_item, dim_E))))
+        self.num_layers = num_layers
+        for n in range(num_layers):
+            self.__setattr__(f'conv_embed_{n + 1}', GraphConvolutionalLayer(has_act=has_act, aggr_mode=aggr_mode))
+
+    def forward(self, adj, weight_vector):
+        x = [torch.nn.functional.normalize(self.id_embedding) if self.has_norm else self.id_embedding]
+
+        for layer in range(self.num_layers):
+            x += self.__getattr__(f'conv_embed_{layer + 1}')(x[layer], adj, weight_vector)
+
+        return torch.sum(x)
+
+
+class CGCN(torch.nn.Module):
+    def __init__(self,
+                 features,
+                 num_user,
+                 num_item,
+                 dim_C,
+                 aggr_mode,
+                 num_routing,
+                 has_act,
+                 has_norm,
+                 rows,
+                 ptr,
+                 ptr_full,
+                 device,
+                 is_word=False):
+        super(CGCN, self).__init__()
+        self.num_user = num_user
+        self.num_item = num_item
+        self.aggr_mode = aggr_mode
+        self.num_routing = num_routing
+        self.has_act = has_act
+        self.has_norm = has_norm
+        self.dim_C = dim_C
+        self.preference = torch.nn.Parameter(torch.nn.init.xavier_normal_(torch.rand((num_user, dim_C))))
+        self.conv_embed_1 = GraphRefiningLayer(rows, has_act, ptr, ptr_full)
+        self.is_word = is_word
+        self.device = device
+
+        if is_word:
+            self.word_tensor = torch.LongTensor(features).to(self.device)
+            self.features = torch.nn.Embedding(torch.max(features[1]) + 1, dim_C)
+            torch.nn.init.xavier_normal_(self.features.weight)
+
+        else:
+            self.dim_feat = features.size(1)
+            self.features = features
+            self.MLP = torch.nn.Linear(self.dim_feat, self.dim_C)
+
+    def forward(self, adj, adj_user):
+
+        if self.is_word:
+            features = torch.tensor(scatter_('mean', self.features(self.word_tensor[1]), self.word_tensor[0])).to(self.device)
+        else:
+            features = torch.nn.functional.leaky_relu(self.MLP(self.features))
+
+        if self.has_norm:
+            preference = torch.nn.functional.normalize(self.preference)
+            features = torch.nn.functional.normalize(features)
+
+        for i in range(self.num_routing):
+            x = torch.cat((preference, features), dim=0)
+            x_hat_1 = self.conv_embed_1(x, adj_user)
+            preference = preference + x_hat_1[:self.num_user]
+
+            if self.has_norm:
+                preference = torch.nn.functional.normalize(preference)
+
+        x = torch.cat((preference, features), dim=0)
+
+        x_hat_1 = self.conv_embed_1(x, adj)
+
+        if self.has_act:
+            x_hat_1 = torch.nn.functional.leaky_relu_(x_hat_1)
+
+        return x + x_hat_1, self.conv_embed_1.alpha.view(-1, 1)
 
 
 class GRCNModel(torch.nn.Module, ABC):
@@ -32,15 +120,16 @@ class GRCNModel(torch.nn.Module, ABC):
                  weight_mode,
                  pruning,
                  has_act,
+                 has_norm,
                  fusion_mode,
                  multimodal_features,
                  adj,
                  adj_user,
                  rows,
-                 cols,
                  ptr,
                  ptr_full,
                  random_seed,
+                 dropout,
                  name="GRCN",
                  **kwargs
                  ):
@@ -58,162 +147,111 @@ class GRCNModel(torch.nn.Module, ABC):
 
         self.num_users = num_users
         self.num_items = num_items
-        self.embed_k = embed_k
-        self.embed_k_multimod = embed_k_multimod
-        self.learning_rate = learning_rate
-        self.l_w = l_w
-        self.modalities = modalities
-        self.aggregation = aggregation
         self.weight_mode = weight_mode
-        self.pruning = pruning
-        self.has_act = has_act
         self.fusion_mode = fusion_mode
+        self.weight = torch.tensor([[1.0], [-1.0]]).cuda()
+        self.l_w = l_w
+        self.dropout = dropout
+        self.modalities = modalities
+        self.lr = learning_rate
         self.n_layers = num_layers
-        self.n_routings = num_routings
+
         self.adj = adj
         self.adj_user = adj_user
-        self.rows = torch.tensor(rows, dtype=torch.int64)
-        self.cols = torch.tensor(cols, dtype=torch.int64)
-        self.ptr = ptr
-        self.ptr_full = ptr_full
+        self.id_gcn = EGCN(num_users, num_items, embed_k, aggregation, has_act, has_norm, num_layers)
 
-        # collaborative embeddings
-        self.Gu = torch.nn.Embedding(self.num_users, self.embed_k)
-        torch.nn.init.xavier_uniform_(self.Gu.weight)
-        self.Gu.to(self.device)
-        self.Gi = torch.nn.Embedding(self.num_items, self.embed_k)
-        torch.nn.init.xavier_uniform_(self.Gi.weight)
-        self.Gi.to(self.device)
-
-        # multimodal collaborative embeddings
-        self.Gum = torch.nn.ParameterDict()
-        self.multimodal_features_shapes = [mf.shape[1] for mf in multimodal_features]
-        for m_id, m in enumerate(modalities):
-            self.Gum[m] = torch.nn.Embedding(self.num_users, self.embed_k_multimod).weight
-            torch.nn.init.xavier_uniform_(self.Gum[m])
-            self.Gum[m].to(self.device)
+        self.pruning = pruning
 
         # multimodal features
-        self.Fm = []
         for m_id, m in enumerate(modalities):
-            self.Fm += [torch.tensor(multimodal_features[m_id], dtype=torch.float32, device=self.device)]
+            self.__setattr__(f'{m}_feat', torch.from_numpy(multimodal_features[m_id]).type(torch.float32).to(self.device))
+            self.__setattr__(f'{m}_gcn', CGCN(self.__getattribute__(f'{m}_feat'),
+                                              num_users,
+                                              num_items,
+                                              embed_k_multimod,
+                                              aggregation,
+                                              num_routings,
+                                              has_act,
+                                              has_norm,
+                                              rows=rows,
+                                              ptr=ptr,
+                                              ptr_full=ptr_full,
+                                              device=self.device
+                                              ))
 
-        # graph convolutional network
-        propagation_graph_convolutional_network_list = []
-        for layer in range(self.n_layers):
-            propagation_graph_convolutional_network_list.append((
-                GraphConvolutionalLayer(self.has_act), 'x, edge_index -> x'
-            ))
-        self.propagation_graph_convolutional_network = torch_geometric.nn.Sequential(
-            'x, edge_index', propagation_graph_convolutional_network_list)
-        self.propagation_graph_convolutional_network.to(self.device)
+        self.model_specific_conf = torch.nn.Parameter(
+            torch.nn.init.xavier_normal_(torch.rand((num_users + num_items, len(modalities))))
+        ).to(self.device)
+        self.result = torch.nn.init.xavier_normal_(torch.rand((num_users + num_items, embed_k))).to(self.device)
 
-        # graph refining network for each modality
-        self.projection_multimodal = torch.nn.ModuleDict()
-        self.propagation_graph_refining_network = torch.nn.ModuleDict()
-        for m_id, m in enumerate(self.modalities):
-            self.projection_multimodal[m] = torch.nn.Linear(in_features=self.multimodal_features_shapes[m_id],
-                                                            out_features=self.embed_k_multimod)
-            self.projection_multimodal[m].to(self.device)
-            propagation_graph_refining_network_list = []
-            for layer in range(self.n_routings):
-                propagation_graph_refining_network_list.append(
-                    (GraphRefiningLayer(self.rows, self.has_act, self.ptr.to(self.device)), 'x, edge_index -> x'))
-            propagation_graph_refining_network_list.append(
-                (GraphRefiningLayer(self.rows, self.has_act, self.ptr.to(self.device),
-                                    self.ptr_full.to(self.device)), 'x, edge_index -> x'))
-            self.propagation_graph_refining_network[m] = torch_geometric.nn.Sequential(
-                'x, edge_index', propagation_graph_refining_network_list)
-            self.propagation_graph_refining_network[m].to(self.device)
-
-        # model specific parameters
-        self.model_specific_conf = torch.nn.Embedding(self.num_users + self.num_items, len(self.modalities))
-        torch.nn.init.xavier_uniform_(self.model_specific_conf.weight)
-        self.model_specific_conf.to(self.device)
-
-        # placeholder for calculated user and item embeddings
-        self.user_embeddings = torch.nn.init.xavier_uniform_(torch.rand((self.num_users, self.embed_k)))
-        self.user_embeddings.to(self.device)
-        self.item_embeddings = torch.nn.init.xavier_uniform_(torch.rand((self.num_items, self.embed_k)))
-        self.item_embeddings.to(self.device)
-
-        self.softplus = torch.nn.Softplus()
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        self.optimizer = torch.optim.Adam([{'params': self.parameters(), 'lr': self.learning_rate}])
 
     def propagate_embeddings(self):
-        # Graph Refining Layers
-        x_all_m = []
-        alphas_m = []
-        for m_id, m in enumerate(self.modalities):
-            gum = torch.nn.functional.normalize(self.Gum[m].to(self.device))
-            gim = torch.nn.functional.normalize(
-                torch.nn.functional.leaky_relu(self.projection_multimodal[m](self.Fm[m_id].to(self.device))))
-            x_all_m += [torch.cat((gum, gim), dim=0)]
+        weight = None
+        content_rep = None
+        num_modal = 0
+        edge_index, _ = dropout_adj(self.adj, p=self.dropout)
 
-            for t in range(self.n_routings):
-                x_all_hat_m = list(
-                    self.propagation_graph_refining_network[m].children()
-                )[t](x_all_m[m_id].to(self.device),
-                     gum[self.rows].to(self.device),
-                     gim[self.cols - self.num_users].to(self.device),
-                     self.adj_user.to(self.device))
-                gum += x_all_hat_m[:self.num_users]
-                gum = torch.nn.functional.normalize(gum)
-                x_all_m[m_id] = torch.cat((gum, gim), dim=0)
+        if self.v_feat is not None:
+            num_modal += 1
+            v_rep, weight_v = self.v_gcn(edge_index)
+            weight = weight_v
+            content_rep = v_rep
 
-            x_all_m[m_id] = torch.cat((gum, gim), dim=0)
-            x_all_hat_m = list(
-                self.propagation_graph_refining_network[m].children()
-            )[-1](x_all_m[m_id].to(self.device),
-                  torch.cat((gum[self.rows], gim[self.cols - self.num_users]), dim=0).to(self.device),
-                  torch.cat((gim[self.cols - self.num_users], gum[self.rows]), dim=0).to(self.device),
-                  self.adj.to(self.device),
-                  True)
-            x_all_m[m_id] = x_all_m[m_id] + x_all_hat_m
-            alphas_m += [list(self.propagation_graph_refining_network[m].children())[-1].alpha]
+        if self.a_feat is not None:
+            num_modal += 1
+            a_rep, weight_a = self.a_gcn(edge_index)
+            if weight is None:
+                weight = weight_a
+                content_rep = a_rep
+            else:
+                content_rep = torch.cat((content_rep, a_rep), dim=1)
+                if self.weight_mode == 'mean':
+                    weight = weight + weight_a
+                else:
+                    weight = torch.cat((weight, weight_a), dim=1)
 
-        # Graph Convolutional Layers
-        x_all = torch.cat(x_all_m, dim=1)
-        alphas = torch.stack(alphas_m, dim=1)
+        if self.t_feat is not None:
+            num_modal += 1
+            t_rep, weight_t = self.t_gcn(edge_index)
+            if weight is None:
+                weight = weight_t
+                conetent_rep = t_rep
+            else:
+                content_rep = torch.cat((content_rep, t_rep), dim=1)
+                if self.weight_mode == 'mean':
+                    weight = weight + weight_t
+                else:
+                    weight = torch.cat((weight, weight_t), dim=1)
+
         if self.weight_mode == 'mean':
-            alphas = torch.sum(alphas, dim=1) / len(self.modalities)
+            weight = weight / num_modal
+
         elif self.weight_mode == 'max':
-            alphas, _ = torch.max(alphas, dim=1)
+            weight, _ = torch.max(weight, dim=1)
+            weight = weight.view(-1, 1)
+
         elif self.weight_mode == 'confid':
-            confidence = torch.cat((self.model_specific_conf.weight[self.rows],
-                                    self.model_specific_conf.weight[self.cols]), dim=0)
-            alphas = alphas * confidence
-            alphas, _ = torch.max(alphas, dim=1)
-        else:
-            raise NotImplementedError('This weight mode has not been implemented yet!')
+            confidence = torch.cat((self.model_specific_conf[edge_index[0]], self.model_specific_conf[edge_index[1]]),
+                                   dim=0)
+            weight = weight * confidence
+            weight, _ = torch.max(weight, dim=1)
+            weight = weight.view(-1, 1)
 
         if self.pruning:
-            alphas = torch.relu(alphas)
+            weight = torch.relu(weight)
 
-        ego_embeddings = torch.cat((self.Gu.weight.to(self.device), self.Gi.weight.to(self.device)), 0)
-        all_embeddings = [torch.nn.functional.normalize(ego_embeddings)]
-        for layer in range(self.n_layers):
-            all_embeddings += [torch.nn.functional.normalize(
-                list(self.propagation_graph_convolutional_network.children())[layer](
-                    all_embeddings[layer].to(self.device),
-                    self.adj.to(self.device),
-                    alphas.to(self.device)))]
-        all_embeddings = torch.stack(all_embeddings, dim=1)
-        all_embeddings = torch.sum(all_embeddings, dim=1)
+        id_rep = self.id_gcn(edge_index, weight)
 
         if self.fusion_mode == 'concat':
-            x = torch.cat([all_embeddings, x_all], dim=1)
+            representation = torch.cat((id_rep, content_rep), dim=1)
         elif self.fusion_mode == 'id':
-            x = all_embeddings
+            representation = id_rep
         elif self.fusion_mode == 'mean':
-            x = torch.mean(torch.stack(x_all_m + [all_embeddings]), dim=0)
-        else:
-            raise NotImplementedError('This fusion mode has not been implemented yet!')
+            representation = (id_rep + v_rep + a_rep + t_rep) / 4
 
-        gu, gi = torch.split(x, [self.num_users, self.num_items], 0)
-        self.user_embeddings = gu
-        self.item_embeddings = gi
-        return gu, gi
+        self.result = representation
+        return representation
 
     def forward(self, inputs, **kwargs):
         gu, gi = inputs

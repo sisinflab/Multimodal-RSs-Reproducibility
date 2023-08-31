@@ -1,74 +1,34 @@
-from ast import literal_eval as make_tuple
-
 from tqdm import tqdm
+import numpy as np
 import torch
 import os
-import numpy as np
 
 from elliot.utils.write import store_recommendation
 from .custom_sampler import Sampler
 from elliot.recommender import BaseRecommenderModel
 from elliot.recommender.base_recommender_model import init_charger
 from elliot.recommender.recommender_utils_mixin import RecMixin
-from .LATTICEModel import LATTICEModel
-import math
+from .BM3Model import BM3Model
+from ast import literal_eval as make_tuple
 
 from torch_sparse import SparseTensor
-
 from torch_sparse import mul, fill_diag, sum
+
+import math
 
 
 def apply_norm(edge_index, add_self_loops=True):
     adj_t = edge_index
     if add_self_loops:
         adj_t = fill_diag(adj_t, 1.)
-    deg = sum(adj_t, dim=1)
-    deg_inv = deg.pow_(-1)
-    deg_inv.masked_fill_(deg_inv == float('inf'), 0.)
+    deg = sum(adj_t, dim=1) + 1e-7
+    deg_inv = deg.pow_(-0.5)
     norm_adj_t = mul(adj_t, deg_inv.view(-1, 1))
+    norm_adj_t = mul(norm_adj_t, deg_inv.view(1, -1))
     return norm_adj_t
 
 
-class LATTICE(RecMixin, BaseRecommenderModel):
-    r"""
-    Mining Latent Structures for Multimedia Recommendation
-
-    For further details, please refer to the `paper <https://dl.acm.org/doi/10.1145/3474085.3475259>`_
-
-    Args:
-        lr: Learning rate
-        epochs: Number of epochs
-        n_layers: Number of propagation layers for the item-item graph
-        n_ui_layers: Number of propagation layers for the user-item graph
-        factors: Number of latent factors
-        factors_multimod: Tuple with number of units for each modality
-        batch_size: Batch size
-        l_w: Regularization coefficient
-        modalities: Tuple of modalities
-        lambda: Parameter for the skip connection on the adjacency matrix
-        top_k: Top-k for similarity matrix
-
-    To include the recommendation model, add it to the config file adopting the following pattern:
-
-    .. code:: yaml
-
-      models:
-        LATTICE:
-          meta:
-            save_recs: True
-          lr: 0.0001
-          epochs: 400
-          n_layers: 1
-          n_ui_layers: 3
-          factors: 64
-          factors_multimod: 64
-          batch_size: 1024
-          l_w: 0.000001
-          modalities: (visual, textual)
-          lambda: 0.1
-          top_k: 100
-    """
-
+class BM3(RecMixin, BaseRecommenderModel):
     @init_charger
     def __init__(self, data, config, params, *args, **kwargs):
         ######################################
@@ -76,27 +36,24 @@ class LATTICE(RecMixin, BaseRecommenderModel):
         self._params_list = [
             ("_learning_rate", "lr", "lr", 0.0005, float, None),
             ("_factors", "factors", "factors", 64, int, None),
-            ("_l_w", "l_w", "l_w", 0.01, float, None),
-            ("_n_layers", "n_layers", "n_layers", 1, int, None),
-            ("_n_ui_layers", "n_ui_layers", "n_ui_layers", 3, int, None),
-            ("_top_k", "top_k", "top_k", 100, int, None),
-            ("_factors_multimod", "factors_multimod", "factors_multimod", 64, int, None),
-            ("_cf", "cf", "cf", 'lightgcn', str, None),
+            ("_multimod_factors", "multimod_factors", "multimod_factors", 64, int, None),
+            ("_reg_weight", "reg_weight", "reg_weight", 0.01, float, None),
+            ("_cl_weight", "cl_weight", "cl_weight", 0.01, float, None),
+            ("_dropout", "dropout", "dropout", 0.1, float, None),
             ("_modalities", "modalities", "modalites", "('visual','textual')", lambda x: list(make_tuple(x)),
              lambda x: self._batch_remove(str(x), " []").replace(",", "-")),
-            ("_lambda", "l_m", "l_m", 0.1, float, None),
-            ("_ws", "ws", "ws", "(64,64,64)", lambda x: list(make_tuple(x)),
-             lambda x: self._batch_remove(str(x), " []").replace(",", "-")),
-            ("_dl", "dl", "dl", "(0.1,0.1,0.1)", lambda x: list(make_tuple(x)),
-             lambda x: self._batch_remove(str(x), " []").replace(",", "-")),
+            ("_n_layers", "n_layers", "n_layers", 1, int, None),
             ("_loaders", "loaders", "loads", "('VisualAttribute','TextualAttribute')", lambda x: list(make_tuple(x)),
+             lambda x: self._batch_remove(str(x), " []").replace(",", "-")),
+            ("_lr_sched", "lr_sched", "lr_sched", "(0.96,50)", lambda x: list(make_tuple(x)),
              lambda x: self._batch_remove(str(x), " []").replace(",", "-"))
         ]
         self.autoset_params()
 
-        self._sampler = Sampler(self._data.i_train_dict, self._batch_size, self._seed)
         if self._batch_size < 1:
             self._batch_size = self._num_users
+
+        self._sampler = Sampler(self._data.transactions, self._batch_size)
 
         row, col = data.sp_i_train.nonzero()
         col = [c + self._num_users for c in col]
@@ -107,7 +64,7 @@ class LATTICE(RecMixin, BaseRecommenderModel):
                                 sparse_sizes=(self._num_users + self._num_items,
                                               self._num_users + self._num_items))
 
-        self.adj = apply_norm(self.adj, add_self_loops=True)
+        self.adj = apply_norm(self.adj, add_self_loops=False)
 
         for m_id, m in enumerate(self._modalities):
             self.__setattr__(f'''_side_{m}''',
@@ -118,29 +75,26 @@ class LATTICE(RecMixin, BaseRecommenderModel):
             all_multimodal_features.append(self.__getattribute__(
                 f'''_side_{self._modalities[m_id]}''').object.get_all_features())
 
-        self._model = LATTICEModel(
+        self._model = BM3Model(
             num_users=self._num_users,
             num_items=self._num_items,
-            num_layers=self._n_layers,
-            num_ui_layers=self._n_ui_layers,
             learning_rate=self._learning_rate,
             embed_k=self._factors,
-            embed_k_multimod=self._factors_multimod,
-            l_w=self._l_w,
-            modalities=self._modalities,
-            l_m=self._lambda,
-            top_k=self._top_k,
-            multimodal_features=all_multimodal_features,
+            n_layers=self._n_layers,
             adj=self.adj,
-            cf_model=self._cf,
-            weight_size=self._ws,
-            dropout_list=self._dl,
+            modalities=self._modalities,
+            multimod_embed_k=self._multimod_factors,
+            multimodal_features=all_multimodal_features,
+            reg_weight=self._reg_weight,
+            cl_weight=self._cl_weight,
+            dropout=self._dropout,
+            learning_rate_scheduler=self._lr_sched,
             random_seed=self._seed
         )
 
     @property
     def name(self):
-        return "LATTICE" \
+        return "BM3" \
                + f"_{self.get_base_params_shortcut()}" \
                + f"_{self.get_params_shortcut()}"
 
@@ -151,23 +105,23 @@ class LATTICE(RecMixin, BaseRecommenderModel):
         for it in self.iterate(self._epochs):
             loss = 0
             steps = 0
-            build_item_graph = True
-            self._model.train()
-            n_batch = int(
-                self._data.transactions / self._batch_size) if self._data.transactions % self._batch_size == 0 else int(
-                self._data.transactions / self._batch_size) + 1
+            n_batch = int(self._data.transactions / self._batch_size) if self._data.transactions % self._batch_size == 0 else int(self._data.transactions / self._batch_size) + 1
+            self._data.edge_index = self._data.edge_index.sample(frac=1, replace=False).reset_index(drop=True)
+            edge_index = np.array([self._data.edge_index['userId'].tolist(), self._data.edge_index['itemId'].tolist()])
             with tqdm(total=n_batch, disable=not self._verbose) as t:
-                for _ in range(n_batch):
-                    user, pos, neg = self._sampler.step()
+                for batch in self._sampler.step(edge_index):
                     steps += 1
-                    loss += self._model.train_step((user, pos, neg), build_item_graph)
+                    self._model.optimizer.zero_grad()
+                    current_loss = self._model.train_step(batch)
+                    loss += current_loss.detach().cpu().numpy()[0]
+                    current_loss.backward()
+                    self._model.optimizer.step()
 
                     if math.isnan(loss) or math.isinf(loss) or (not loss):
                         break
 
                     t.set_postfix({'loss': f'{loss / steps:.5f}'})
                     t.update()
-                    build_item_graph = False
                 self._model.lr_scheduler.step()
 
             self.evaluate(it, loss / (it + 1))
@@ -175,15 +129,13 @@ class LATTICE(RecMixin, BaseRecommenderModel):
     def get_recommendations(self, k: int = 100):
         predictions_top_k_test = {}
         predictions_top_k_val = {}
-        self._model.eval()
-        with torch.no_grad():
-            gum, gim = self._model.propagate_embeddings(build_item_graph=True)
-            for index, offset in enumerate(range(0, self._num_users, self._batch_size)):
-                offset_stop = min(offset + self._batch_size, self._num_users)
-                predictions = self._model.predict(gum[offset: offset_stop], gim)
-                recs_val, recs_test = self.process_protocol(k, predictions, offset, offset_stop)
-                predictions_top_k_val.update(recs_val)
-                predictions_top_k_test.update(recs_test)
+        gu, gi = self._model.propagate_embeddings()
+        for index, offset in enumerate(range(0, self._num_users, self._batch_size)):
+            offset_stop = min(offset + self._batch_size, self._num_users)
+            predictions = self._model.predict(gu[offset: offset_stop], gi)
+            recs_val, recs_test = self.process_protocol(k, predictions, offset, offset_stop)
+            predictions_top_k_val.update(recs_val)
+            predictions_top_k_test.update(recs_test)
         return predictions_top_k_val, predictions_top_k_test
 
     def get_single_recommendation(self, mask, k, predictions, offset, offset_stop):

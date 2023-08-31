@@ -9,38 +9,12 @@ from .custom_sampler import Sampler
 from elliot.utils.write import store_recommendation
 
 from elliot.recommender import BaseRecommenderModel
-from .VBPRModel import VBPRModel
+from .MBPRModel import MBPRModel
 from elliot.recommender.recommender_utils_mixin import RecMixin
 from elliot.recommender.base_recommender_model import init_charger
 
 
-class VBPR(RecMixin, BaseRecommenderModel):
-    r"""
-    VBPR: Visual Bayesian Personalized Ranking from Implicit Feedback
-
-    For further details, please refer to the `paper <http://www.aaai.org/ocs/index.php/AAAI/AAAI16/paper/view/11914>`_
-
-    Args:
-        lr: Learning rate
-        epochs: Number of epochs
-        factors: Number of latent factors
-        batch_size: Batch size
-        l_w: Regularization coefficient
-
-    To include the recommendation model, add it to the config file adopting the following pattern:
-
-    .. code:: yaml
-
-      models:
-        VBPR:
-          meta:
-            save_recs: True
-          lr: 0.0005
-          epochs: 50
-          factors: 100
-          batch_size: 128
-          l_w: 0.000025
-    """
+class MBPR(RecMixin, BaseRecommenderModel):
 
     @init_charger
     def __init__(self, data, config, params, *args, **kwargs):
@@ -51,6 +25,8 @@ class VBPR(RecMixin, BaseRecommenderModel):
             ("_modalities", "modalities", "modalites", "('visual','textual')", lambda x: list(make_tuple(x)),
              lambda x: self._batch_remove(str(x), " []").replace(",", "-")),
             ("_l_w", "l_w", "l_w", 0.1, float, None),
+            ("_lr_sched", "lr_sched", "lr_sched", "(0.96,50)", lambda x: list(make_tuple(x)),
+             lambda x: self._batch_remove(str(x), " []").replace(",", "-")),
             ("_loaders", "loaders", "loads", "('VisualAttribute','TextualAttribute')", lambda x: list(make_tuple(x)),
              lambda x: self._batch_remove(str(x), " []").replace(",", "-"))
         ]
@@ -59,7 +35,11 @@ class VBPR(RecMixin, BaseRecommenderModel):
         if self._batch_size < 1:
             self._batch_size = self._data.transactions
 
-        self._sampler = Sampler(self._data.i_train_dict, self._batch_size, self._seed)
+        self._sampler = Sampler(self._data.i_train_dict,
+                                self._data.transactions,
+                                self._batch_size,
+                                self._data.edge_index['itemId'].unique().tolist(),
+                                self._seed)
 
         for m_id, m in enumerate(self._modalities):
             self.__setattr__(f'''_side_{m}''',
@@ -79,17 +59,19 @@ class VBPR(RecMixin, BaseRecommenderModel):
         else:
             all_multimodal_features = self._side_visual.object.get_all_features()
 
-        self._model = VBPRModel(self._num_users,
+        self._model = MBPRModel(self._num_users,
                                 self._num_items,
                                 self._learning_rate,
                                 self._factors,
                                 self._l_w,
                                 all_multimodal_features,
+                                self._modalities,
+                                self._lr_sched,
                                 self._seed)
 
     @property
     def name(self):
-        return "VBPR" \
+        return "MBPR" \
                + f"_{self.get_base_params_shortcut()}" \
                + f"_{self.get_params_shortcut()}"
 
@@ -103,26 +85,32 @@ class VBPR(RecMixin, BaseRecommenderModel):
             n_batch = int(
                 self._data.transactions / self._batch_size) if self._data.transactions % self._batch_size == 0 else int(
                 self._data.transactions / self._batch_size) + 1
+            self._data.edge_index = self._data.edge_index.sample(frac=1, replace=False).reset_index(drop=True)
+            edge_index = np.array([self._data.edge_index['userId'].tolist(), self._data.edge_index['itemId'].tolist()])
             with tqdm(total=n_batch, disable=not self._verbose) as t:
-                for _ in range(n_batch):
-                    user, pos, neg = self._sampler.step()
+                for batch in self._sampler.step(edge_index):
+                    user, pos, neg = batch
                     steps += 1
-                    loss += self._model.train_step((user, pos, neg))
+                    current_loss = self._model.train_step((user, pos, neg))
+                    loss += current_loss
 
                     if math.isnan(loss) or math.isinf(loss) or (not loss):
                         break
 
                     t.set_postfix({'loss': f'{loss / steps:.5f}'})
                     t.update()
+                self._model.lr_scheduler.step()
 
             self.evaluate(it, loss / (it + 1))
 
     def get_recommendations(self, k: int = 100):
         predictions_top_k_test = {}
         predictions_top_k_val = {}
+        self._model.eval()
         for index, offset in enumerate(range(0, self._num_users, self._batch_size)):
             offset_stop = min(offset + self._batch_size, self._num_users)
-            predictions = self._model.predict(offset, offset_stop)
+            gu, gi = self._model.propagate_embeddings()
+            predictions = self._model.predict(gu[offset:offset_stop], gi)
             recs_val, recs_test = self.process_protocol(k, predictions, offset, offset_stop)
             predictions_top_k_val.update(recs_val)
             predictions_top_k_test.update(recs_test)

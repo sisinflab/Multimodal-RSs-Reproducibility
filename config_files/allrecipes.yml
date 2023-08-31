@@ -18,25 +18,14 @@ experiment:
   gpu: -1
   external_models_path: ../external/models/__init__.py
   models:
-    external.VBPR:
+    external.BM3:
       meta:
         hyper_opt_alg: grid
         verbose: True
         save_weights: False
-        save_recs: False
-        validation_rate: 1
+        validation_rate: 10
         validation_metric: Recall@20
         restore: False
-      lr: 0.0005
-      modalities: ('visual', 'textual')
+        write_best_iterations: True
       epochs: 200
-      factors: 64
-      batch_size: 1024
-      l_w: 1e-5
-      comb_mod: concat
-      seed: 123
-      early_stopping:
-        patience: 10
-        mode: auto
-        monitor: Recall@20
-        verbose: True
+      batch_size: 2048
