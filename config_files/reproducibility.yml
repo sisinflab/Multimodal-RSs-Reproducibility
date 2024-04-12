@@ -39,7 +39,6 @@ experiment:
       cf: lightgcn
       batch_size: 1024
       l_w: [1e-5, 1e-2]
-      lr_sched: (1.0,50)
       seed: 123
       early_stopping:
         patience: 10
