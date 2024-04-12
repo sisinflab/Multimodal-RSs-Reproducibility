@@ -1,0 +1,48 @@
+experiment:
+  backend: pytorch
+  data_config:
+    strategy: fixed
+    train_path: ../data/{0}/train.tsv
+    validation_path: ../data/{0}/val.tsv
+    test_path: ../data/{0}/test.tsv
+    side_information:
+      - dataloader: VisualAttribute
+        visual_features: ../data/{0}/image_feat
+      - dataloader: TextualAttribute
+        textual_features: ../data/{0}/text_feat
+  dataset: baby
+  top_k: 50
+  evaluation:
+    cutoffs: [10, 20, 50]
+    simple_metrics: [Recall, nDCG, Precision, HR, EFD, Gini, ItemCoverage, APLT]
+  gpu: 0
+  external_models_path: ../external/models/__init__.py
+  models:
+    external.LATTICE:
+      meta:
+        hyper_opt_alg: grid
+        verbose: True
+        save_weights: False
+        save_recs: False
+        validation_rate: 5
+        validation_metric: Recall@20
+        restore: False
+      lr: 0.0005
+      n_layers: 1
+      n_ui_layers: 2
+      top_k: 10
+      modalities: ('visual', 'textual')
+      loaders: ('VisualAttribute','TextualAttribute')
+      epochs: 200
+      factors: 64
+      factors_multimod: 64
+      cf: lightgcn
+      batch_size: 1024
+      l_w: [1e-5, 1e-2]
+      lr_sched: (1.0,50)
+      seed: 123
+      early_stopping:
+        patience: 10
+        mode: auto
+        monitor: Recall@20
+        verbose: True
